@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+.streamlit/secrets.toml
+*.egg-info/
+
+# Data files (datasets are stored locally, not in the repo)
+*.json
+*.csv
+*.parquet
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.xlsx
+
+# Internal iteration reports (Dutch-language working documents)
+ITERATIE_*.md
