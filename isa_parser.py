@@ -1483,3 +1483,133 @@ def load_from_bytes(content: bytes, source_hint: str = "<upload>") -> ISAParser:
     )
     parser.set_source_bytes(content, source_hint)
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Project-folder scanning (one-step folder selection — supervisor point 6)
+# ---------------------------------------------------------------------------
+
+def _looks_like_isa_phm(data: Any) -> bool:
+    """Cheap discriminator: a real ISA-PHM investigation has studies, at least
+    one of which carries an `assays` list. Wizard/project JSONs (e.g. a
+    'Knarskast Test Measurement.json') lack this shape and are rejected."""
+    if not isinstance(data, dict):
+        return False
+    studies = data.get("studies")
+    if not isinstance(studies, list) or not studies:
+        return False
+    return any(isinstance(s, dict) and isinstance(s.get("assays"), list) for s in studies)
+
+
+def _collect_data_file_paths(data: dict, cap: int = 20) -> list[str]:
+    """Gather CSV path strings the wrapper would resolve against data_root.
+    Prefers studies[].assays[].dataFiles[].name; falls back to a generic scan."""
+    paths: list[str] = []
+    for s in data.get("studies", []) or []:
+        if not isinstance(s, dict):
+            continue
+        for a in s.get("assays", []) or []:
+            if not isinstance(a, dict):
+                continue
+            for df in a.get("dataFiles", []) or []:
+                if isinstance(df, dict):
+                    nm = df.get("name") or df.get("filename")
+                    if nm and str(nm).lower().endswith(".csv"):
+                        paths.append(str(nm))
+                        if len(paths) >= cap:
+                            return paths
+    if not paths:
+        def _walk(o: Any) -> None:
+            if len(paths) >= cap:
+                return
+            if isinstance(o, dict):
+                for v in o.values():
+                    _walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    _walk(v)
+            elif isinstance(o, str) and o.lower().endswith(".csv"):
+                paths.append(o)
+        _walk(data)
+    return paths[:cap]
+
+
+def _walk_limited(base: Path, max_depth: int):
+    """os.walk that prunes traversal beyond `max_depth` levels under base."""
+    base = base.resolve()
+    base_depth = len(base.parts)
+    for dirpath, dirnames, filenames in os.walk(base):
+        depth = len(Path(dirpath).resolve().parts) - base_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        yield dirpath, dirnames, filenames
+
+
+def _candidate_dirs(base: Path, json_parent: Path, max_depth: int, cap: int = 300) -> list[Path]:
+    """Directories to test as data_root, json_parent and base first (the
+    'root holds both' case), then a bounded breadth of subdirectories."""
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for d in (json_parent, base):
+        rp = str(Path(d).resolve())
+        if rp not in seen:
+            seen.add(rp)
+            ordered.append(Path(d))
+    for dirpath, _dirnames, _files in _walk_limited(base, max_depth):
+        rp = str(Path(dirpath).resolve())
+        if rp not in seen:
+            seen.add(rp)
+            ordered.append(Path(dirpath))
+        if len(ordered) >= cap:
+            break
+    return ordered
+
+
+def _detect_data_root(base: Path, json_parent: Path, rel_paths: list[str], max_depth: int) -> Path:
+    """Pick the directory under which the ISA-JSON's CSV paths resolve. Falls
+    back to the JSON's own folder when nothing resolves (e.g. hardcoded Windows
+    absolute paths), which still lets metadata load."""
+    if not rel_paths:
+        return json_parent
+    norm = [r.replace("\\", "/").lstrip("/") for r in rel_paths]
+    for d in _candidate_dirs(base, json_parent, max_depth):
+        for rel in norm:
+            try:
+                if (d / rel).exists() or (d / Path(rel).name).exists():
+                    return d
+            except OSError:
+                continue
+    return json_parent
+
+
+def scan_project_folder(folder: str, max_depth: int = 3) -> dict | None:
+    """Scan a project folder for an ISA-PHM JSON and infer its data directory.
+
+    Returns {"json_path": str, "data_root": str} for the shallowest valid
+    ISA-PHM file found, or None if the folder has none. The data_root is the
+    directory against which the JSON's CSV paths resolve (commonly the folder
+    itself or the JSON's parent)."""
+    base = Path(folder).expanduser()
+    if not base.is_dir():
+        return None
+
+    json_paths: list[Path] = []
+    for dirpath, _dirnames, filenames in _walk_limited(base, max_depth):
+        for fn in filenames:
+            if fn.lower().endswith(".json"):
+                json_paths.append(Path(dirpath) / fn)
+    # Prefer shallower files (closer to the chosen root).
+    json_paths.sort(key=lambda p: len(p.resolve().parts))
+
+    for jp in json_paths:
+        try:
+            data = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _looks_like_isa_phm(data):
+            continue
+        rel_paths = _collect_data_file_paths(data)
+        data_root = _detect_data_root(base, jp.parent, rel_paths, max_depth)
+        return {"json_path": str(jp), "data_root": str(data_root)}
+
+    return None

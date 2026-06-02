@@ -10,8 +10,8 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from isa_parser import load_from_bytes
-from agent import run_agent
+from isa_parser import load_from_bytes, load_from_file, scan_project_folder
+from agent import run_agent, run_agent_stream
 import tools as tools_module
 
 load_dotenv()
@@ -143,12 +143,26 @@ if "datasets" not in st.session_state:
     st.session_state.datasets = {}
 if "data_dirs" not in st.session_state:
     st.session_state.data_dirs = {}
+if "working_copies" not in st.session_state:
+    # Session-scoped cleaned-signal store. Keyed by
+    # "dataset::study::sensor::run_id"; written by process_signal, read by
+    # load_run_csv / make_plot. Threaded into run_agent and mutated in place.
+    st.session_state.working_copies = {}
 if "validation_cache" not in st.session_state:
     st.session_state.validation_cache = {}
 if "client" not in st.session_state:
     st.session_state.client = None
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
+if "token_usage_total" not in st.session_state:
+    st.session_state.token_usage_total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "turns": 0,
+    }
+if "project_folder_input" not in st.session_state:
+    st.session_state.project_folder_input = ""
 if "api_key" not in st.session_state:
     st.session_state.api_key = os.getenv("ANTHROPIC_API_KEY", "")
 if "show_api_key_panel" not in st.session_state:
@@ -214,6 +228,154 @@ def _render_agent_trace(trace: list[dict]) -> None:
             if preview:
                 st.caption("Result preview:")
                 st.code(preview, language="json")
+
+
+def _fmt_tokens(n: int) -> str:
+    """Human-friendly token count: 1234 -> '1,234', 12345 -> '12.3k'."""
+    n = int(n or 0)
+    if n < 10_000:
+        return f"{n:,}"
+    return f"{n / 1000:.1f}k"
+
+
+def _render_token_usage(usage: dict | None) -> None:
+    """Render a compact token-usage line for one assistant turn.
+
+    `usage` is the dict returned by run_agent:
+        {"input_tokens", "output_tokens", "total_tokens",
+         "rounds", "per_round": [{"input", "output"}, ...]}
+    """
+    if not usage or not usage.get("total_tokens"):
+        return
+    in_t = usage.get("input_tokens", 0)
+    out_t = usage.get("output_tokens", 0)
+    total = usage.get("total_tokens", 0)
+    rounds = usage.get("rounds", 0)
+    st.caption(
+        f"🪙 {_fmt_tokens(total)} tokens this turn "
+        f"· {_fmt_tokens(in_t)} in / {_fmt_tokens(out_t)} out "
+        f"· {rounds} model call{'s' if rounds != 1 else ''}"
+    )
+    per_round = usage.get("per_round", [])
+    if len(per_round) > 1:
+        with st.expander("Token breakdown per model call", expanded=False):
+            rows = [
+                {
+                    "Call": i,
+                    "Input": r.get("input", 0),
+                    "Output": r.get("output", 0),
+                    "Total": r.get("input", 0) + r.get("output", 0),
+                }
+                for i, r in enumerate(per_round, start=1)
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _reset_token_usage() -> None:
+    st.session_state.token_usage_total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "turns": 0,
+    }
+
+
+def _working_copies_for(dataset_name: str) -> dict:
+    """Return the working-copy entries belonging to one dataset."""
+    return {
+        k: v for k, v in st.session_state.working_copies.items()
+        if v.get("dataset") == dataset_name
+    }
+
+
+def _drop_working_copies(dataset_name: str) -> None:
+    """Remove all cached cleaned data for one dataset (reset-to-raw)."""
+    for k in list(st.session_state.working_copies.keys()):
+        if st.session_state.working_copies[k].get("dataset") == dataset_name:
+            del st.session_state.working_copies[k]
+
+
+def _summarize_transforms(transforms: list) -> str:
+    """Compact one run's transform list, e.g. 'fix_outliers(iqr); fill_missing(interpolate)'."""
+    parts = []
+    for t in transforms or []:
+        op = t.get("op")
+        if op == "fix_outliers":
+            parts.append(f"fix_outliers({t.get('method', 'iqr')}/{t.get('strategy', 'clip')})")
+        elif op == "fill_missing":
+            parts.append(f"fill_missing({t.get('strategy', 'interpolate')})")
+        elif op:
+            parts.append(op)
+    return "; ".join(parts)
+
+
+def _pick_folder_dialog() -> str | None:
+    """Open a native folder picker in a SEPARATE process and return the chosen path.
+
+    Why a subprocess: tkinter must run on the process's main thread, but Streamlit
+    runs this script on a worker thread. Calling tkinter directly here crashes the
+    whole Streamlit server on macOS ("Connection error"), and the crash happens
+    below Python so a try/except can't catch it. Running the dialog in its own
+    child process isolates the GUI — if anything goes wrong, only the child dies
+    and Streamlit keeps running. Returns the path, or None if cancelled/unavailable.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "r = tk.Tk(); r.withdraw()\n"
+        "try:\n"
+        "    r.attributes('-topmost', True); r.lift(); r.focus_force()\n"
+        "except Exception:\n"
+        "    pass\n"
+        "p = filedialog.askdirectory(title='Select project folder')\n"
+        "r.destroy()\n"
+        "print(p or '')\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception:
+        return None
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+    return lines[-1].strip() if lines else None
+
+
+def _load_project_folder(folder: str) -> tuple[bool, str]:
+    """Scan a project folder for an ISA-PHM JSON, load it, and auto-connect the
+    detected data directory. Returns (success, message)."""
+    found = scan_project_folder(folder)
+    if not found:
+        return False, (
+            "No ISA-PHM JSON found in that folder (only non-ISA / wizard files?). "
+            "Use the upload + data-directory fields below instead."
+        )
+    json_path = found["json_path"]
+    data_root = found["data_root"]
+    name = os.path.basename(json_path)
+    if name in st.session_state.datasets:
+        return False, f"'{name}' is already loaded."
+    try:
+        parser = load_from_file(json_path)
+    except Exception as e:
+        return False, f"Found {name} but failed to load it: {e}"
+
+    ok, msg = parser.attach_wrapper(data_root)
+    st.session_state.datasets[name] = parser
+    st.session_state.data_dirs[name] = data_root if ok else ""
+    _refresh_validation(name)
+    if ok:
+        return True, f"Loaded **{name}** · data dir connected:\n`{data_root}`"
+    return True, (
+        f"Loaded **{name}**, but could not auto-connect the data dir ({msg}). "
+        f"Set it manually below."
+    )
 
 
 def _short_json(value) -> str:
@@ -327,11 +489,55 @@ with st.sidebar:
     current_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     st.caption(f"Model: `{current_model}`")
 
+    # --- Session token usage ---
+    _tut = st.session_state.token_usage_total
+    if _tut["turns"]:
+        st.caption(
+            f"🪙 Session: **{_fmt_tokens(_tut['total_tokens'])}** tokens "
+            f"over {_tut['turns']} turn{'s' if _tut['turns'] != 1 else ''} "
+            f"({_fmt_tokens(_tut['input_tokens'])} in / "
+            f"{_fmt_tokens(_tut['output_tokens'])} out)"
+        )
+
     st.markdown("---")
 
     # --- Datasets ---
     st.markdown("**Datasets**")
 
+    # One-step project folder: scan for the ISA-JSON and auto-set its data dir.
+    # Apply a folder chosen via the native dialog on the previous run (must run
+    # before the text_input is instantiated, or Streamlit rejects the write).
+    if "_folder_pick" in st.session_state:
+        st.session_state.project_folder_input = st.session_state.pop("_folder_pick")
+
+    st.caption("Project folder — auto-detect the ISA-JSON and its data:")
+    col_path, col_browse = st.columns([3, 1])
+    folder_val = col_path.text_input(
+        "Project folder",
+        key="project_folder_input",
+        placeholder="/path/to/project (ISA-JSON + CSVs)",
+        label_visibility="collapsed",
+    )
+    if col_browse.button("Browse", help="Browse for a folder (native dialog)", use_container_width=True):
+        picked = _pick_folder_dialog()
+        if picked:
+            st.session_state["_folder_pick"] = picked
+            st.rerun()
+        else:
+            st.warning("Native folder picker unavailable here — paste the path instead.")
+    if st.button("Load from folder", use_container_width=True, key="load_from_folder"):
+        target = (folder_val or "").strip()
+        if not target:
+            st.warning("Enter or browse to a project folder first.")
+        else:
+            ok, msg = _load_project_folder(target)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
+
+    st.caption("or upload a JSON (set its data directory below):")
     uploaded_file = st.file_uploader(
         "Upload an ISA-PHM JSON file",
         type=["json"],
@@ -363,8 +569,10 @@ with st.sidebar:
             del st.session_state.datasets[name]
             st.session_state.data_dirs.pop(name, None)
             st.session_state.validation_cache.pop(name, None)
+            _drop_working_copies(name)
             st.session_state.conversation_history = []
             st.session_state.chat_messages = []
+            _reset_token_usage()
             st.rerun()
             continue
 
@@ -401,6 +609,27 @@ with st.sidebar:
         if wstatus in ("invalid_data_root", "init_failed") and getattr(parser, "wrapper_error", ""):
             st.caption(f"⚠ {parser.wrapper_error}")
 
+        # Working-copy chip — shows how many runs have cached cleaned data.
+        wc_runs = _working_copies_for(name)
+        if wc_runs:
+            col_chip, col_reset = st.columns([7, 3])
+            col_chip.markdown(
+                f'<span class="pill pill-pass">working data: '
+                f'{len(wc_runs)} run(s) cleaned</span>',
+                unsafe_allow_html=True,
+            )
+            if col_reset.button(
+                "Reset to raw", key=f"wc_reset_{name}",
+                help="Discard cleaned working copies for this dataset; "
+                     "tools will read the raw files again.",
+            ):
+                _drop_working_copies(name)
+                st.rerun()
+            transform_summaries = sorted({
+                _summarize_transforms(wc["transforms"]) for wc in wc_runs.values()
+            })
+            st.caption("Applied: " + "; ".join(t for t in transform_summaries if t))
+
     st.markdown("---")
 
     # --- Export + Clear ---
@@ -432,6 +661,8 @@ with st.sidebar:
     if st.button("Clear conversation", use_container_width=True):
         st.session_state.conversation_history = []
         st.session_state.chat_messages = []
+        st.session_state.working_copies = {}
+        _reset_token_usage()
         st.rerun()
 
 
@@ -475,6 +706,7 @@ if _active == "Chat":
                 for plot_id in msg.get("plot_ids", []):
                     _render_registered_figure(plot_id)
                 _render_agent_trace(msg.get("tool_trace", []))
+                _render_token_usage(msg.get("usage"))
 
         if user_input:
             st.session_state.chat_messages.append({"role": "user", "content": user_input})
@@ -482,48 +714,98 @@ if _active == "Chat":
                 st.markdown(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("Thinking…"):
-                    try:
-                        pre_plot_ids = set(tools_module.FIGURE_REGISTRY.keys())
+                try:
+                    pre_plot_ids = set(tools_module.FIGURE_REGISTRY.keys())
 
-                        answer, updated_history, tool_trace = run_agent(
-                            user_message=user_input,
-                            conversation_history=st.session_state.conversation_history,
-                            parsers=st.session_state.datasets,
-                            client=st.session_state.client,
-                            data_dirs=st.session_state.data_dirs,
-                        )
-                        st.session_state.conversation_history = updated_history
+                    # Live streaming (point 4): show the model's thinking and its
+                    # tool calls as they happen, and stream the answer token-by-token.
+                    # run_agent_stream yields events; the terminal "done" event carries
+                    # the final answer/history/trace/usage (same payload as run_agent).
+                    status = st.status("Thinking…", expanded=True)
+                    thinking_ph = status.empty()
+                    answer_ph = st.empty()
+                    thinking_parts: list[str] = []
+                    answer_parts: list[str] = []
+                    done_event: dict | None = None
 
-                        new_plot_ids = [
-                            pid for pid in tools_module.FIGURE_REGISTRY.keys()
-                            if pid not in pre_plot_ids
-                        ]
+                    for ev in run_agent_stream(
+                        user_message=user_input,
+                        conversation_history=st.session_state.conversation_history,
+                        parsers=st.session_state.datasets,
+                        client=st.session_state.client,
+                        data_dirs=st.session_state.data_dirs,
+                        working_copies=st.session_state.working_copies,
+                    ):
+                        etype = ev.get("type")
+                        if etype == "thinking":
+                            thinking_parts.append(ev["text"])
+                            thinking_ph.markdown("🧠 _Thinking…_\n\n" + "".join(thinking_parts))
+                        elif etype == "text":
+                            answer_parts.append(ev["text"])
+                            answer_ph.markdown("".join(answer_parts))
+                        elif etype == "tool_start":
+                            status.update(label=f"Using tool: {ev['name']}…")
+                            status.write(f"🔧 `{ev['name']}`")
+                        elif etype == "tool_end":
+                            status.write(f"   ↳ {ev.get('status', 'ok')}")
+                        elif etype == "done":
+                            done_event = ev
 
-                        st.session_state.chat_messages.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "plot_ids": new_plot_ids,
-                            "tool_trace": tool_trace,
-                        })
-                        st.markdown(answer)
+                    # Finalize from the terminal event.
+                    done_event = done_event or {}
+                    answer = done_event.get("text", "".join(answer_parts))
+                    tool_trace = done_event.get("tool_trace", [])
+                    usage = done_event.get("usage", {})
+                    st.session_state.conversation_history = done_event.get(
+                        "history", st.session_state.conversation_history
+                    )
 
-                        for pid in new_plot_ids:
-                            _render_registered_figure(pid)
-                        _render_agent_trace(tool_trace)
+                    status.update(
+                        label=(f"Done — {len(tool_trace)} tool call(s)" if tool_trace else "Done"),
+                        state="complete",
+                        expanded=False,
+                    )
+                    if not thinking_parts:
+                        thinking_ph.empty()
+                    answer_ph.markdown(answer)
 
-                    except anthropic.AuthenticationError:
-                        err = "Invalid API key. Please check the key entered in the sidebar."
-                        st.error(err)
-                        st.session_state.chat_messages.append(
-                            {"role": "assistant", "content": err}
-                        )
-                    except Exception as e:
-                        err = f"An error occurred: {e}"
-                        st.error(err)
-                        st.session_state.chat_messages.append(
-                            {"role": "assistant", "content": err}
-                        )
+                    # Fold this turn's tokens into the running session total.
+                    _sess = st.session_state.token_usage_total
+                    _sess["input_tokens"] += usage.get("input_tokens", 0)
+                    _sess["output_tokens"] += usage.get("output_tokens", 0)
+                    _sess["total_tokens"] += usage.get("total_tokens", 0)
+                    _sess["turns"] += 1
+
+                    new_plot_ids = [
+                        pid for pid in tools_module.FIGURE_REGISTRY.keys()
+                        if pid not in pre_plot_ids
+                    ]
+
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "plot_ids": new_plot_ids,
+                        "tool_trace": tool_trace,
+                        "usage": usage,
+                    })
+
+                    for pid in new_plot_ids:
+                        _render_registered_figure(pid)
+                    _render_agent_trace(tool_trace)
+                    _render_token_usage(usage)
+
+                except anthropic.AuthenticationError:
+                    err = "Invalid API key. Please check the key entered in the sidebar."
+                    st.error(err)
+                    st.session_state.chat_messages.append(
+                        {"role": "assistant", "content": err}
+                    )
+                except Exception as e:
+                    err = f"An error occurred: {e}"
+                    st.error(err)
+                    st.session_state.chat_messages.append(
+                        {"role": "assistant", "content": err}
+                    )
 
     # Prompt library — collapsed by default, opens via expander
     if st.session_state.datasets and not st.session_state.chat_messages:
