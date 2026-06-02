@@ -333,13 +333,20 @@ def _build_system_prompt(parsers: dict[str, ISAParser], data_dirs: dict[str, str
     )
 
 
+def _empty_usage() -> dict:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0, "per_round": []}
+
+
 def _accumulate_usage(usage: dict, response_usage) -> None:
-    """Fold one API response's token counts into the running per-turn total."""
+    """Fold one API response's token counts into the running per-turn total.
+
+    Cached input (cache write + cache read) is billed separately from input_tokens;
+    we lump all three into the input total so it reflects every token the model saw.
+    """
     if response_usage is None:
         return
     in_t = int(getattr(response_usage, "input_tokens", 0) or 0)
     out_t = int(getattr(response_usage, "output_tokens", 0) or 0)
-    # Cached input is billed separately from input_tokens; include for honest totals.
     in_t += int(getattr(response_usage, "cache_creation_input_tokens", 0) or 0)
     in_t += int(getattr(response_usage, "cache_read_input_tokens", 0) or 0)
     usage["input_tokens"] += in_t
@@ -372,17 +379,72 @@ def _summarize_tool_result(result_str: str, max_chars: int = 400) -> tuple[str, 
 
 
 def _stream_kwargs(system_prompt: str, tool_definitions: list, use_thinking: bool) -> dict:
+    """Build the per-call kwargs, with prompt caching on the static prefix.
+
+    The system prompt (~4.5k tokens) and tool definitions (~5.3k tokens) are
+    identical on every round of the agentic loop. Marking them with cache_control
+    makes rounds 2+ (and follow-up turns within the 5-minute TTL) read them from
+    cache at ~10% of the input price. This is purely a billing/transport
+    optimization — the model receives byte-identical input, so output is unaffected.
+
+    Two static breakpoints are set here:
+      1) the last tool definition -> caches the whole tools block
+      2) the system prompt        -> caches tools + system
+    Keeping a separate tools breakpoint means that if the system text changes (e.g.
+    a dataset is loaded/unloaded) the tools cache still hits. A third, rolling
+    breakpoint on the last message is added in _cached_messages.
+    """
+    tools = [dict(t) for t in tool_definitions]
+    if tools:
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     kw = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        tools=tool_definitions,
+        system=[{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=tools,
     )
     if use_thinking:
         # Adaptive thinking: the model decides how much to reason. Streams as
         # thinking_delta events the UI can show live (point 4).
         kw["thinking"] = {"type": "adaptive"}
     return kw
+
+
+def _cached_messages(conversation_history: list) -> list:
+    """Return a copy of the message list with a rolling cache breakpoint on the
+    last message, so the conversation prefix is cached as it grows across rounds.
+
+    At API-call time the last message is always user-role: either the initial user
+    string or a tool_result batch (list of dicts). We add cache_control to its last
+    content block WITHOUT mutating the stored history. Combined with the static
+    tools/system breakpoints, each round reads the prior prefix from cache and only
+    writes the new delta.
+    """
+    if not conversation_history:
+        return conversation_history
+    msgs = list(conversation_history)
+    last = dict(msgs[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict):
+        new_content = list(content)
+        tail = dict(new_content[-1])
+        tail["cache_control"] = {"type": "ephemeral"}
+        new_content[-1] = tail
+        last["content"] = new_content
+    else:
+        return conversation_history
+    msgs[-1] = last
+    return msgs
 
 
 def run_agent_stream(
@@ -420,7 +482,7 @@ def run_agent_stream(
     system_prompt = _build_system_prompt(parsers, data_dirs)
 
     tool_trace: list[dict] = []
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0, "per_round": []}
+    usage = _empty_usage()
     answer_parts: list[str] = []
     use_thinking = ENABLE_THINKING
     produced_output = False
@@ -429,7 +491,7 @@ def run_agent_stream(
     while rounds_done < MAX_TOOL_ROUNDS:
         try:
             with client.messages.stream(
-                messages=conversation_history,
+                messages=_cached_messages(conversation_history),
                 **_stream_kwargs(system_prompt, tool_definitions, use_thinking),
             ) as stream:
                 for event in stream:
@@ -528,6 +590,5 @@ def run_agent(
         if event.get("type") == "done":
             done = event
     if done is None:  # pragma: no cover - generator always yields a terminal event
-        empty = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0, "per_round": []}
-        return "", conversation_history, [], empty
+        return "", conversation_history, [], _empty_usage()
     return done["text"], done["history"], done["tool_trace"], done["usage"]
