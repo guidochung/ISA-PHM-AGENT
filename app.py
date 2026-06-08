@@ -386,6 +386,49 @@ def _short_json(value) -> str:
         return str(value)
 
 
+def _fit_bokeh_to_column(fig) -> int:
+    """Make a Bokeh figure/layout fit the chat column and return the iframe height.
+
+    Two problems this solves:
+    * Width: every wrapper plot is built at a fixed 1150px width, which is wider
+      than the chat column, so the right side was clipped. We switch each panel
+      (and the top-level layout) to ``stretch_width`` so it scales to the column.
+    * Height: some tools (e.g. outlier comparison) return a *layout* of stacked
+      panels. A layout has no usable ``.height``, so the old fixed heuristic only
+      reserved room for one panel and cut off the rest. We sum the heights of the
+      actual panels instead, so the whole figure is visible.
+
+    Must be called before ``file_html`` so the serialised HTML reflects the
+    responsive sizing.
+    """
+    try:
+        from bokeh.models import Plot
+        panels = [m for m in fig.references() if isinstance(m, Plot)]
+    except Exception:
+        panels = []
+    if not panels:
+        panels = [fig]
+
+    # Scale to the column width instead of overflowing at the fixed 1150px.
+    for panel in panels:
+        try:
+            panel.sizing_mode = "stretch_width"
+        except Exception:
+            pass
+    try:
+        fig.sizing_mode = "stretch_width"  # the top-level layout too
+    except Exception:
+        pass
+
+    # Reserve room for every panel plus its chrome (toolbar/title/axis labels),
+    # with a small base margin for any header Div / inter-panel spacing.
+    per_panel_chrome = 65
+    base_margin = 20
+    return base_margin + sum(
+        int(getattr(panel, "height", 0) or 400) + per_panel_chrome for panel in panels
+    )
+
+
 def _render_registered_figure(plot_id: str) -> None:
     """Render a figure from the tools.FIGURE_REGISTRY in the chat stream.
 
@@ -406,10 +449,12 @@ def _render_registered_figure(plot_id: str) -> None:
         if backend == "bokeh":
             from bokeh.embed import file_html
             from bokeh.resources import CDN
+            # Fit to the column width and size the iframe to all panels before
+            # serialising, then keep scrolling enabled as a safety net so a
+            # tall layout can never be clipped.
+            height = _fit_bokeh_to_column(fig)
             html = file_html(fig, CDN, title)
-            # Heuristic height: tall enough for axis labels + toolbar.
-            height = int(getattr(fig, "height", 0) or 450) + 60
-            st.components.v1.html(html, height=height, scrolling=False)
+            st.components.v1.html(html, height=height, scrolling=True)
         else:
             st.pyplot(fig)
     except Exception as exc:
