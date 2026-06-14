@@ -27,6 +27,37 @@ from isa_parser import ISAParser
 
 
 # ---------------------------------------------------------------------------
+# Global tool-result size guard (Fix 2, 2026-06-09)
+# ---------------------------------------------------------------------------
+# The metadata tools page themselves at source (isa_parser._cap_list), but this
+# guard sits above EVERY tool — in-house metadata, signal tools, and the generic
+# wrapper dispatch — so no single result can ever overflow the context window,
+# including tools not individually bounded and any added later. The ceiling is
+# set above the per-list metadata budget (40 KB) so a legitimately paged result
+# passes through untouched; it only fires as a true last resort.
+_TOOL_RESULT_CEILING = 60000  # characters of serialized JSON
+
+
+def _guard_tool_result(serialized: str, tool_name: str) -> str:
+    """Last-resort size guard. Returns `serialized` unchanged when within the
+    ceiling; otherwise a compact JSON notice with a short preview, so the agent
+    recovers by narrowing its request instead of hitting an API token error."""
+    if len(serialized) <= _TOOL_RESULT_CEILING:
+        return serialized
+    return json.dumps({
+        "_truncated": True,
+        "tool": tool_name,
+        "original_chars": len(serialized),
+        "note": (
+            f"This '{tool_name}' result was {len(serialized)} characters, too large "
+            f"to return safely, so it was truncated. Narrow your query (request a "
+            f"specific study, sensor, or run, or fewer rows) for a complete result."
+        ),
+        "preview": serialized[:8000],
+    }, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
 # Figure registry — populated by plot tools, consumed by the Streamlit app
 # ---------------------------------------------------------------------------
 # Keyed by plot_id. Values are dicts {"figure": bokeh.figure | layout,
@@ -783,7 +814,7 @@ def execute_tool(
             result = _wrapper_api_reference(
                 tool_input.get("class_name"), tool_input.get("search")
             )
-            return json.dumps(result, indent=2, default=str)
+            return _guard_tool_result(json.dumps(result, indent=2, default=str), tool_name)
 
         # Two-dataset tools
         if tool_name == "compare_datasets_metadata":
@@ -792,7 +823,7 @@ def execute_tool(
             if a not in parsers or b not in parsers:
                 return json.dumps({"error": f"One or both datasets not loaded. Available: {list(parsers.keys())}"})
             result = _compare_datasets_metadata(parsers[a], parsers[b], a, b)
-            return json.dumps(result, indent=2, default=str)
+            return _guard_tool_result(json.dumps(result, indent=2, default=str), tool_name)
 
         # Every other tool requires dataset_name
         dataset_name = tool_input.get("dataset_name")
@@ -890,7 +921,7 @@ def execute_tool(
     except Exception as e:
         result = {"error": f"{type(e).__name__}: {e}"}
 
-    return json.dumps(result, indent=2, default=str)
+    return _guard_tool_result(json.dumps(result, indent=2, default=str), tool_name)
 
 
 # ---------------------------------------------------------------------------

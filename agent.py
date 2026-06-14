@@ -60,6 +60,10 @@ Supporting concepts:
 - Configuration: the physical component installed for an experiment (one per distinct test article)
 - Run-to-failure: a run sequence ending in a defined failure event
 
+Synonyms from the ISA-PHM paper and the Wizard: users may say 'Experiment' for a Study, \
+and 'operating conditions' or 'fault specifications' for Study Factors. Accept these on \
+input, but answer using the ISA terms above.
+
 NEVER use 'row', 'column', or 'file' as the primary concept when describing the dataset \
 - always speak in terms of investigation/study/assay/run.
 
@@ -247,6 +251,12 @@ Key REAL methods for ML / analysis (confirm exact signatures via get_wrapper_api
 - assay.lifecycle_features(file_type="auto")        per-run RMS / kurtosis / etc.
 - assay.load_dataframe_with_meta(run_id=..., file_type="auto")  -> (df, meta).
 - assay.plot_timeseries / plot_frequency_domain / plot_psd / ...  -> Bokeh figures.
+- run.factor_values()  this run's operating conditions / settings. A factor value \
+      stored as a relative .csv path is AUTO-RESOLVED: a 1x1 CSV becomes a float, a \
+      multi-row CSV becomes a timeseries summary. So factor values are real numbers, \
+      not path strings; you can group / compare runs by operating condition directly.
+- run.load_factor_timeseries(factor_name)  the FULL DataFrame for a factor whose \
+      value is a multi-row (timeseries) CSV.
 
 The wrapper does NOT train models or split data — wrap its DataFrame output with \
 standard libraries (tf.keras, sklearn) for the modelling part.
@@ -298,7 +308,8 @@ you are never limited to the curated tools:
 Capabilities reachable this way (always confirm names via get_wrapper_api): \
 sensor_catalog, operating_conditions, fault_conditions, get_fault_labels, \
 test_matrix (target=study); to_ml_dataset, missing_values_report, detect_outliers, \
-sensor_info (target=assay); export_labeled_dataset (target=study).
+sensor_info (target=assay); export_labeled_dataset (target=study); \
+load_factor_timeseries (target=run, for a CSV-backed timeseries factor value).
 
 Rules:
 - NEVER invent a method or argument. If get_wrapper_api does not list it, it does \

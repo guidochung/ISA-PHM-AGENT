@@ -62,6 +62,63 @@ OPERATING_LIKE_TYPES = {"operating condition", "operating_condition", "load", "s
 DEGRADATION_LIKE_NAMES = {"vb", "rul", "wear", "flank", "degradation"}
 
 
+# ---------------------------------------------------------------------------
+# Metadata enumeration cap (Fix 1, 2026-06-09)
+# ---------------------------------------------------------------------------
+# The in-house query methods (list_studies, list_data_files, get_run_inventory,
+# ...) used to return every record unbounded. On a dataset with very many
+# entities (e.g. a ~100 MB ISA-PHM JSON with hundreds of studies/files/runs) a
+# single result could exceed the model's context window or the per-minute token
+# rate limit, which is exactly what blocked querying such a set.
+#
+# The budget below is set ABOVE the largest output any currently-used dataset
+# produces (measured 2026-06-09: C-MAPSS `list_studies` ~30 KB), so every
+# existing dataset is returned in FULL and byte-identical (no behaviour or
+# accuracy change). Only a dataset large enough to exceed the budget gets a
+# bounded, count-aware page that reports the true total and how to narrow. Whole
+# records are never split, so the model always receives complete, valid entries.
+# The vendored wrapper (isa_phm/) is untouched.
+_METADATA_LIST_BUDGET = 40000  # characters of json.dumps output
+
+
+def _cap_records(items: list, budget: int = _METADATA_LIST_BUDGET):
+    """Largest prefix of WHOLE records whose serialized size fits `budget`.
+    Returns (kept_list, total_count, truncated). A non-list passes through."""
+    if not isinstance(items, list):
+        return items, None, False
+    if len(json.dumps(items, default=str)) <= budget:
+        return items, len(items), False
+    kept: list = []
+    size = 2  # the surrounding "[]"
+    for it in items:
+        s = len(json.dumps(it, default=str)) + 1  # +1 for the joining comma
+        if size + s > budget:
+            break
+        kept.append(it)
+        size += s
+    return kept, len(items), True
+
+
+def _cap_list(items: list, item_label: str = "items"):
+    """Cap a list-returning metadata tool. Returns the list unchanged when it
+    fits the budget (byte-identical to pre-fix output); otherwise a dict with the
+    true total, the records shown, and a 'narrow your query' note."""
+    kept, total, truncated = _cap_records(items)
+    if not truncated:
+        return items
+    return {
+        "_truncated": True,
+        "total_count": total,
+        "shown": len(kept),
+        item_label: kept,
+        "note": (
+            f"Showing the first {len(kept)} of {total} {item_label} to stay within "
+            f"the model's token limit. Narrow your query (ask about a specific "
+            f"study, sensor, or run) to retrieve the rest."
+        ),
+    }
+
+
 class ISAParser:
     def __init__(self, data: dict):
         self.data = data
@@ -321,7 +378,7 @@ class ISAParser:
                 "number_of_samples": len(s.get("materials", {}).get("samples", [])),
                 "factors": [f.get("factorName", "") for f in s.get("factors", [])],
             })
-        return result
+        return _cap_list(result, "studies")
 
     def get_study_details(self, study_title: str) -> dict | str:
         study = self._find_study(study_title)
@@ -464,7 +521,7 @@ class ISAParser:
                         "file": df.get("name", ""),
                         "type": df.get("type", ""),
                     })
-        return results
+        return _cap_list(results, "data_files")
 
     def search_metadata(self, term: str) -> dict:
         term_lower = term.lower()
@@ -964,11 +1021,22 @@ class ISAParser:
             "match": expected_runs == len(samples) if expected_runs else None,
         }
 
-        return {
+        runs_capped, runs_total, runs_truncated = _cap_records(runs)
+        result = {
             "study": study_title,
-            "runs": runs,
+            "runs": runs_capped,
             "continuity": continuity,
         }
+        if runs_truncated:
+            result["_truncated"] = True
+            result["runs_total"] = runs_total
+            result["runs_shown"] = len(runs_capped)
+            result["note"] = (
+                f"Showing the first {len(runs_capped)} of {runs_total} runs to stay "
+                f"within the model's token limit. Ask about a specific run or sensor "
+                f"to retrieve the rest."
+            )
+        return result
 
     def get_label_coverage(self) -> dict:
         """Per-study label coverage: fault label, degradation label, operating

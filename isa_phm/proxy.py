@@ -34,6 +34,7 @@ from .errors import (
     StudyNotFoundError,
     ValidationError,
 )
+from .factor_utils import resolve_factor_csv_value
 from .schemas import (
     AssayModel,
     AssayOverview,
@@ -2438,14 +2439,51 @@ class RunProxy:
             processed_file_path=(
                 self._run.processed_file.path if self._run.processed_file else None
             ),
-            factor_values=self._run.factor_values,
+            factor_values=self.factor_values(),
             measurement_params=[pv.model_dump() for pv in self._run.measurement_params],
             processing_params=[pv.model_dump() for pv in self._run.processing_params],
         )
 
     def factor_values(self) -> dict[str, object]:
-        """Return study-level factor values for this run."""
-        return dict(self._run.factor_values)
+        """Return study-level factor values for this run, with CSV paths resolved."""
+        data_root = getattr(self._integrator, "_data_root", None)
+        return {
+            k: resolve_factor_csv_value(v, data_root)
+            for k, v in self._run.factor_values.items()
+        }
+
+    def load_factor_timeseries(self, factor_name: str) -> pd.DataFrame:
+        """Load the full timeseries DataFrame for a CSV-backed factor value.
+
+        Parameters
+        ----------
+        factor_name : str
+            The factor whose value is a relative ``.csv`` path.
+
+        Returns
+        -------
+        pd.DataFrame
+            Full CSV contents (no header assumed).
+
+        Raises
+        ------
+        ValueError
+            When the factor value is not a CSV path, or data_root is unset.
+        """
+        from .factor_utils import load_factor_csv_dataframe
+
+        raw_value = self._run.factor_values.get(factor_name)
+        if not isinstance(raw_value, str) or not raw_value.strip().lower().endswith(".csv"):
+            raise ValueError(
+                f"Factor '{factor_name}' is not a CSV-backed value "
+                f"(stored value: {raw_value!r})."
+            )
+        data_root = getattr(self._integrator, "_data_root", None)
+        if data_root is None:
+            raise ValueError(
+                "data_root is not set on the integrator — cannot resolve factor CSV path."
+            )
+        return load_factor_csv_dataframe(raw_value, data_root)
 
     def load_dataframe(self, file_type: Literal["raw", "processed", "auto"] = "processed") -> pd.DataFrame:
         """Load this run's data file into a DataFrame."""

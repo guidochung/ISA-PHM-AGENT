@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from .errors import AmbiguousRunError, DataFileError, RunNotFoundError
+from .factor_utils import resolve_factor_csv_value
 from .schemas import AssayModel, DataFile, DataLoadMetadata, RunRecord
 from .utils import compute_features
 
@@ -229,7 +230,7 @@ class DataIntegrator:
                 "study_id": study_id,
                 "assay_id": assay.assay_id,
                 **features,
-                **{f"fv_{k}": v for k, v in run.factor_values.items()},
+                **{f"fv_{k}": resolve_factor_csv_value(v, self._data_root) for k, v in run.factor_values.items()},
             }
 
     def _compute_run_features(
@@ -268,7 +269,7 @@ class DataIntegrator:
             "study_id": study_id,
             "assay_id": assay.assay_id,
             **features,
-            **{f"fv_{k}": v for k, v in run.factor_values.items()},
+            **{f"fv_{k}": resolve_factor_csv_value(v, self._data_root) for k, v in run.factor_values.items()},
         }
 
     def lifecycle_features_df(
