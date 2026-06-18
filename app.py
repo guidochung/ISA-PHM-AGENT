@@ -391,8 +391,13 @@ def _fit_bokeh_to_column(fig) -> int:
 
     Two problems this solves:
     * Width: every wrapper plot is built at a fixed 1150px width, which is wider
-      than the chat column, so the right side was clipped. We switch each panel
-      (and the top-level layout) to ``stretch_width`` so it scales to the column.
+      than the chat column, so the right side was clipped. We switch every node
+      in the layout tree (the top-level column, any intermediate gridplot/row,
+      and each plot panel) to ``stretch_width`` so it scales to the column. It is
+      not enough to set it on the plot panels alone: a stretch_width plot left
+      inside a fixed-size gridplot collapses its frame to zero width in Bokeh
+      3.x, so the axes and toolbar still render but the data canvas comes out
+      blank (this is what broke the outlier-comparison comparison panels).
     * Height: some tools (e.g. outlier comparison) return a *layout* of stacked
       panels. A layout has no usable ``.height``, so the old fixed heuristic only
       reserved room for one panel and cut off the rest. We sum the heights of the
@@ -402,21 +407,27 @@ def _fit_bokeh_to_column(fig) -> int:
     responsive sizing.
     """
     try:
-        from bokeh.models import Plot
-        panels = [m for m in fig.references() if isinstance(m, Plot)]
+        from bokeh.models import LayoutDOM, Plot
+        refs = list(fig.references())
     except Exception:
-        panels = []
+        refs = []
+    panels = [m for m in refs if isinstance(m, Plot)]
     if not panels:
         panels = [fig]
 
-    # Scale to the column width instead of overflowing at the fixed 1150px.
-    for panel in panels:
-        try:
-            panel.sizing_mode = "stretch_width"
-        except Exception:
-            pass
+    # Scale to the column width instead of overflowing at the fixed 1150px. Every
+    # layout node must become stretch_width together — setting it on the panels
+    # but leaving an intervening gridplot fixed collapses the panel frames, so the
+    # waveform disappears while the axes remain. Plot is itself a LayoutDOM, so
+    # this loop also covers the panels.
+    for node in refs:
+        if isinstance(node, LayoutDOM):
+            try:
+                node.sizing_mode = "stretch_width"
+            except Exception:
+                pass
     try:
-        fig.sizing_mode = "stretch_width"  # the top-level layout too
+        fig.sizing_mode = "stretch_width"  # safety net for the top-level layout
     except Exception:
         pass
 
